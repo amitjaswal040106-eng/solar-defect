@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar Panel Defect Classification</title>
+<style>
+:root{--bg:#eef0f2;--surface:#fff;--ink:#14213d;--muted:#5b6577;--line:#d3d8e0;--hot:#d98a0b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.6 system-ui,-apple-system,sans-serif}
+main{max-width:56rem;margin:0 auto;padding:2rem 1.25rem 4rem}
+h1{font:600 clamp(2rem,5vw,3rem)/1.1 Georgia,serif;margin:0 0 1rem;max-width:18ch}
+h2{font:600 1.6rem/1.2 Georgia,serif;margin:3rem 0 .8rem}
+p{max-width:40rem}.muted{color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:1.25rem}
+#drop{border:2px dashed #9aa5ba;border-radius:10px;padding:2rem;text-align:center;cursor:pointer}
+#drop.over,#drop:focus-visible{border-color:var(--hot);outline:none}
+.out{display:grid;gap:1.25rem;grid-template-columns:repeat(auto-fit,minmax(14rem,1fr));margin-top:1.25rem}
+.out[hidden]{display:none}
+.out img{width:100%;max-width:300px;border-radius:6px;display:block}
+.row{display:grid;grid-template-columns:5.5rem 1fr 3.6rem;gap:.6rem;align-items:center;margin:.5rem 0}
+.track{background:var(--line);height:1rem;border-radius:3px}
+.fill{height:100%;border-radius:3px;background:var(--ink);width:0;transition:width .3s}
+.warn{border-left:3px solid var(--hot);padding-left:1rem;margin:.8rem 0}
+.wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:32rem;font-size:.95rem}
+th,td{padding:.6rem .8rem;text-align:left;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600}
+button{font:inherit;padding:.5rem 1rem;border-radius:6px;border:1px solid var(--ink);background:var(--ink);color:#fff;cursor:pointer}
+</style>
+</head>
+<body>
+<main>
+<h1>Finding defective solar cells in EL images</h1>
+<p class="muted">A ResNet18 model fine-tuned on the ELPV dataset (2,624 images) labels each solar cell image as healthy or defective.</p>
+
+<h2>Try it</h2>
+<div class="card">
+  <div id="drop" tabindex="0" role="button">Drop an EL image of one solar cell here, or
+    <button type="button" id="pick">Choose image</button></div>
+  <input id="file" type="file" accept="image/*" hidden>
+  <p id="status" class="muted" aria-live="polite"></p>
+  <div id="warnings"></div>
+  <div id="result" class="out" hidden>
+    <div><img id="orig" alt="Uploaded image"><p class="muted">Your image</p></div>
+    <div><img id="heat" alt="Grad-CAM heatmap"><p class="muted">Where the model looked (Grad-CAM). Red means more influence. A rough guide, not proof of reasoning.</p></div>
+    <div>
+      <p><b id="verdict"></b></p>
+      <div class="row"><span>Healthy</span><div class="track"><div class="fill" id="b0"></div></div><span id="p0"></span></div>
+      <div class="row"><span>Defective</span><div class="track"><div class="fill" id="b1"></div></div><span id="p1"></span></div>
+    </div>
+  </div>
+  <p class="muted">The model understands only 300×300 grayscale EL images of single cells. It misses about 1 in 5 defective cells, and ordinary photos give meaningless results. Do not use it for real inspection decisions.</p>
+</div>
+
+<h2>Results on the held-out test set (394 images)</h2>
+<div class="card wrap"><table>
+<thead><tr><th>Model</th><th>Accuracy</th><th>Macro-F1</th><th>Defective recall</th><th>Defective precision</th></tr></thead>
+<tbody>
+<tr><td>Majority baseline</td><td>0.688</td><td>0.408</td><td>0.000</td><td>n/a</td></tr>
+<tr><td>Small CNN (1 seed)</td><td>0.736</td><td>0.715</td><td>0.748</td><td>0.558</td></tr>
+<tr><td><b>ResNet18 (mean of 3 seeds)</b></td><td>0.883</td><td>0.862</td><td>0.783</td><td>0.833</td></tr>
+</tbody></table></div>
+<p class="muted">ResNet18 macro-F1 ranged from 0.844 to 0.881 across seeds. Always predicting "healthy" scores 69% accuracy while finding no defects.</p>
+
+<h2>Where it fails</h2>
+<p>Cells with an uncertain 0.33 or 0.67 original label are 14% of the test set but cause 41% of the errors (21 of 51). One in five clearly defective cells is still missed.</p>
+
+<h2>Limitations</h2>
+<ul>
+<li>No module IDs in the dataset, so cells from one panel may appear in several splits, which could inflate scores.</li>
+<li>One data split, one dataset, one image type, cell-level only, no field testing.</li>
+<li>The demo uses one trained model (seed 1), while the table reports the mean of three seeds.</li>
+</ul>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// Stop the browser from opening a file dropped outside the box
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => e.preventDefault());
+
+async function send(file) {
+  if (!file) return;
+  $("status").textContent = "Analyzing…";
+  $("warnings").innerHTML = "";
+  $("result").hidden = true;
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const r = await fetch("/predict", { method: "POST", body: fd });
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); }
+    catch (_) { $("status").textContent = "Server replied " + r.status + " from " + location.origin + ": " + text.slice(0, 120); return; }
+    if (!r.ok) { $("status").textContent = j.detail || "Something went wrong."; return; }
+    $("orig").src = URL.createObjectURL(file);
+    $("heat").src = j.heatmap;
+    $("verdict").textContent = "Prediction: " + j.label;
+    [["healthy", 0], ["defective", 1]].forEach(([k, i]) => {
+      $("b" + i).style.width = (j[k] * 100) + "%";
+      $("p" + i).textContent = (j[k] * 100).toFixed(1) + "%";
+    });
+    j.warnings.forEach(w => {
+      const d = document.createElement("div");
+      d.className = "warn";
+      d.textContent = w;
+      $("warnings").appendChild(d);
+    });
+    $("result").hidden = false;
+    $("status").textContent = "";
+  } catch (e) {
+    $("status").textContent = "Failed: " + e.message + " (page opened from " + location.origin + ")";
+  }
+}
+
+// Clicking the box or the button (the click bubbles up) opens the file picker once
+$("drop").onclick = () => $("file").click();
+$("drop").onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click(); } };
+$("file").onchange = e => { send(e.target.files[0]); e.target.value = ""; };
+$("drop").ondragover = e => { e.preventDefault(); $("drop").classList.add("over"); };
+$("drop").ondragleave = () => $("drop").classList.remove("over");
+$("drop").ondrop = e => { e.preventDefault(); $("drop").classList.remove("over"); send(e.dataTransfer.files[0]); };
+</script>
+</body>
+</html>
